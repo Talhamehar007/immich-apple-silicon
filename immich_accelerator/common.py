@@ -258,3 +258,87 @@ def set_auto_requeue(data_dir: Path, enabled: bool) -> None:
     else:
         data_dir.mkdir(parents=True, exist_ok=True)
         marker.touch()
+
+
+# --- Network exposure -------------------------------------------------------
+#
+# Both servers the accelerator runs listen on every interface by default, which
+# is what lets a phone on the same LAN open the dashboard. That default is also
+# the only reason anything else on the network can reach them, and neither
+# carries credentials: Immich's ML contract has no auth (its own container does
+# not either), and the dashboard's one guard is a same-origin check on POSTs,
+# which stops a browser tab and nothing else.
+#
+# Binding to loopback is therefore a real answer, and it is a config key rather
+# than a command-line flag so it survives upgrades and restarts.
+#
+# Only two values are accepted:
+#
+#   0.0.0.0    every interface (the default: unchanged behaviour)
+#   127.0.0.1  this Mac only
+#
+# Anything else is refused rather than passed through. Every check that decides
+# "is the service up" or "is the port free" probes 127.0.0.1 and ::1; a listener
+# bound to one specific LAN address would answer none of them, and the
+# supervisor would report a healthy service as down and start a second copy
+# beside it. Refusing is the honest outcome for a key this code cannot support
+# safely.
+BIND_ANY = "0.0.0.0"
+BIND_LOOPBACK = "127.0.0.1"
+BIND_CHOICES = (BIND_ANY, BIND_LOOPBACK)
+
+# Hosts that mean "this machine" in a URL somebody pasted into config.json.
+_LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
+def bind_host(config: dict, key: str, default: str = BIND_ANY) -> str:
+    """The bind address named by ``config[key]``, or *default*.
+
+    Returns only BIND_CHOICES values. A value this cannot honour is reported
+    once, at configuration time, rather than at bind time where the failure
+    is a stack trace in a log nobody is reading.
+    """
+    raw = config.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, str) and raw.strip() in BIND_CHOICES:
+        return raw.strip()
+    log.warning(
+        'Ignoring %s=%r: use "%s" (every interface) or "%s" (this Mac only).',
+        key,
+        raw,
+        BIND_ANY,
+        BIND_LOOPBACK,
+    )
+    return default
+
+
+def is_loopback_url(url: str) -> bool:
+    """Whether *url* names this machine."""
+    from urllib.parse import urlsplit
+
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    return bool(host) and host.lower() in _LOOPBACK_NAMES
+
+
+def insecure_immich_url(config: dict) -> str | None:
+    """The configured Immich URL when it carries an API key over plain HTTP.
+
+    Split installs (NAS + Mac) are the documented setup, and setup suggests
+    ``http://nas:2283``. That puts Immich's admin API key on the wire in clear
+    text across the LAN, which is worth saying out loud once rather than
+    silently accepting.
+
+    Returns None when there is nothing to warn about: no URL, HTTPS, or a URL
+    that points at this machine (where there is no wire to speak of).
+    """
+    url = config.get("immich_url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    url = url.strip()
+    if not url.lower().startswith("http://"):
+        return None
+    return None if is_loopback_url(url) else url

@@ -228,14 +228,18 @@ let ARCFACE = ProcessInfo.processInfo.environment["ML_ARCFACE"]
 // --- Serve the full /predict contract (CLIP visual+text, faces, OCR) ---
 if CommandLine.arguments.contains("serve") {
     let port = UInt16(CommandLine.arguments.last.flatMap { UInt16($0) } ?? 3999)
+    // Set by the CLI from config.json ("ml_host"). Default unchanged: every
+    // interface, because Immich in Docker reaches this Mac through
+    // host.docker.internal rather than loopback.
+    let host = ProcessInfo.processInfo.environment["ML_HOST"] ?? "0.0.0.0"
     let models = Models(clipDir: MODEL, arcfacePath: ARCFACE)
     print("[native-ml] models ready (clip=\(MODEL), arcface=\(models.arcfaceAvailable ? "ok" : "MISSING"))")
     // The "listening" line comes from startServer's state handler once the port
     // is actually bound. Announcing it here instead printed a service that was
     // up even when the bind had failed, which is how a log full of "serving on
     // :3003" coexisted with a process serving nothing.
-    print("[native-ml] binding :\(port) (/ /ping /health /predict)")
-    startServer(port: port, models: models)
+    print("[native-ml] binding \(host):\(port) (/ /ping /health /predict)")
+    startServer(port: port, models: models, host: host)
     dispatchMain()
 }
 

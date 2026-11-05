@@ -550,6 +550,18 @@ final class ZooCLIP {
                                    message: "model \(name): download failed for \(f) (\(lastError))")
             }
 
+            // The length check above proves that some bytes of the right size
+            // arrived. This proves they are the right bytes, against the digest
+            // Hugging Face publishes for the same file. A wrong model never
+            // fixes itself and the size>0 check below would cache it forever,
+            // so delete it and let the retry fetch it again.
+            if let why = ModelIntegrity.mismatch(
+                fileAt: dst, path: f, repo: "immich-app/\(name)") {
+                try? FileManager.default.removeItem(at: dst)
+                throw PredictError(status: "422 Unprocessable Entity",
+                                   message: "model \(name): \(why)")
+            }
+
             completed += 1
             if reportable {
                 setProgress(FetchProgress(model: name, done: completed, total: all.count))

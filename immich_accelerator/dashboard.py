@@ -8,10 +8,12 @@ Usage:
     python -m immich_accelerator dashboard          # http://localhost:8422
     python -m immich_accelerator dashboard --port 9000
 
-Security note: The dashboard renders data from the local Immich database
-and system metrics. All data sources are trusted (localhost only). The
-HTML rendering uses template literals with numeric/string data from our
-own API — no user-supplied content is rendered as HTML.
+Security note: the dashboard has no authentication. It renders data from the
+local Immich database and system metrics, and its POST endpoints can queue
+Immich work. It binds every interface by default so a phone on the same LAN can
+watch progress; set "dashboard_host": "127.0.0.1" in config.json to restrict it
+to this Mac. The page builds its DOM with textContent rather than innerHTML, so
+values from the API are never parsed as markup.
 """
 
 from __future__ import annotations
@@ -551,10 +553,14 @@ def create_app(config: dict):
     return app
 
 
-def run_dashboard(config: dict, port: int = 8420):
-    """Start the dashboard server."""
+def run_dashboard(config: dict, port: int = 8420, host: str = "0.0.0.0"):
+    """Start the dashboard server.
+
+    *host* comes from config ("dashboard_host"), validated by
+    common.bind_host, and is only ever "0.0.0.0" or "127.0.0.1".
+    """
     import uvicorn
 
     app = create_app(config)
-    log.info("Dashboard: http://localhost:%d", port)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
+    log.info("Dashboard: http://%s:%d", "localhost" if host == "0.0.0.0" else host, port)
+    uvicorn.run(app, host=host, port=port, log_level="warning")

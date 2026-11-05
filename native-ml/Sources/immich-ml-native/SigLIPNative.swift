@@ -348,6 +348,16 @@ final class SigLIPNative {
         sweepPartials(dir: dir, name: name)
         do {
             try fetchWeights(hfRepo: hfRepo, name: name, dst: dst)
+            // Same check as the ONNX zoo, against the same kind of published
+            // digest. This file is up to 4.5 GB of input to mlx, and the
+            // four-way ranged fetch makes a silently wrong body plausible in
+            // more ways than a single connection did.
+            if let why = ModelIntegrity.mismatch(
+                fileAt: dst, path: "model.safetensors", repo: hfRepo) {
+                try? FileManager.default.removeItem(at: dst)
+                throw PredictError(status: "422 Unprocessable Entity",
+                                   message: "model \(name): \(why)")
+            }
         } catch {
             // Both fetch paths are all-or-nothing, so a failure leaves the
             // folder empty. Remove it if this call made it, as ZooCLIP does.

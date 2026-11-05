@@ -105,9 +105,36 @@ private final class Conn {
     }
 }
 
-func startServer(port: UInt16, models: Models, maxConcurrent: Int = 4) {
+// Binds *host*: "0.0.0.0" (every interface, the default, because Immich in
+// Docker reaches the Mac through host.docker.internal, which is not loopback)
+// or "127.0.0.1" (this Mac only, for an install whose worker runs here too).
+// Anything else is refused by the caller's config validation.
+func startServer(port: UInt16, models: Models, maxConcurrent: Int = 4,
+                 host: String = "0.0.0.0") {
     let sem = DispatchSemaphore(value: maxConcurrent)
-    let listener = try! NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: port)!)
+    guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+        FileHandle.standardError.write(Data("[native-ml] invalid port \(port)\n".utf8))
+        exit(64)   // EX_USAGE
+    }
+    let wildcard = (host == "0.0.0.0" || host == "::")
+    let params = NWParameters.tcp
+    if !wildcard {
+        // The port argument to NWListener(using:on:) is only sugar for this
+        // same endpoint, and setting both throws, so the two forms are kept
+        // apart rather than passed together.
+        params.requiredLocalEndpoint = .hostPort(
+            host: NWEndpoint.Host(host), port: nwPort)
+    }
+    let listener: NWListener
+    do {
+        listener = wildcard
+            ? try NWListener(using: params, on: nwPort)
+            : try NWListener(using: params)
+    } catch {
+        FileHandle.standardError.write(
+            Data("[native-ml] cannot listen on \(host):\(port): \(error)\n".utf8))
+        exit(70)   // EX_SOFTWARE
+    }
     // NWListener reports a bind failure asynchronously through this handler, it
     // does not throw from the initializer. Without a handler the failure is
     // swallowed whole: the process stays parked in dispatchMain() forever,
@@ -121,17 +148,17 @@ func startServer(port: UInt16, models: Models, maxConcurrent: Int = 4) {
     listener.stateUpdateHandler = { state in
         switch state {
         case .ready:
-            print("[native-ml] listening on port \(port)")
+            print("[native-ml] listening on \(host):\(port)")
         case .failed(let error):
             FileHandle.standardError.write(
-                Data("[native-ml] cannot listen on port \(port): \(error)\n".utf8))
+                Data("[native-ml] cannot listen on \(host):\(port): \(error)\n".utf8))
             exit(70)   // EX_SOFTWARE
         case .waiting(let error):
             // Transient by contract (Network.framework retries on its own), so
             // not fatal. Logged because a listener stuck here answers nothing
             // and the silence is otherwise indistinguishable from idle.
             FileHandle.standardError.write(
-                Data("[native-ml] waiting to listen on port \(port): \(error)\n".utf8))
+                Data("[native-ml] waiting to listen on \(host):\(port): \(error)\n".utf8))
         default:
             break
         }

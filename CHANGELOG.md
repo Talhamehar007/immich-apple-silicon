@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **One bad cycle no longer stops the supervisor.** The watch loop's only handler was Ctrl-C, so an exception raised anywhere in its 30-second cycle ended the process: a `config.json` that no longer parses, a disk that will not take the recorded mount recipe, anything the cycle did not anticipate. launchd then restarted it straight back into the same cycle, which is a crash loop with the worker and the ML engine stopped, from something that is almost never fatal. Each cycle now logs the traceback and takes the next one, and the services it already started keep running. An unreadable config at startup is retried every 30 seconds instead of exiting, so an install caught half way through a reinstall recovers on its own.
+- **A downloaded model is checked against the digest Hugging Face publishes for it.** The only check before was `Content-Length`, which catches a truncated transfer — the common failure — and nothing else. A file of the right length with the wrong bytes was accepted, and because a non-empty file counts as already downloaded it was then cached forever and handed to onnxruntime or mlx on every start. Both engines now compare each file, streamed in 4 MiB chunks, against the SHA-256 (or, for small files, the git blob SHA-1) in the repository's own file listing, and delete a mismatch so the retry fetches it again. If the listing cannot be reached the download proceeds with one warning, so a listing endpoint having a bad afternoon cannot stop a library from being processed. This detects corruption and a CDN serving the wrong object; it does not defend against a compromised upstream account, which is what pinning digests in the tree would buy and is not claimed here.
+
+### Added
+
+- **The dashboard and the ML service can be kept off the network.** Both listen on every interface, with no authentication: the dashboard's Re-queue button and Auto switch answer any client that can reach the port (its same-origin check stops a browser tab, not `curl`), and `/predict` accepts images from anything that can open a TCP connection. `"dashboard_host"` and `"ml_host"` in `config.json` now take `"127.0.0.1"` to bind loopback only. The default is unchanged, because that is what lets a phone on the same LAN watch progress and what lets Immich in Docker reach the ML engine through `host.docker.internal`; `ml_host` must stay at its default for any setup where Immich runs in Docker. Only `0.0.0.0` and `127.0.0.1` are accepted, because every liveness check here probes loopback and a listener on one LAN address would look dead to the supervisor and be started twice. The keys survive `setup` re-runs and upgrades. See [docs/security.md](docs/security.md).
+- **A split install is told when its API key crosses the network in clear text.** Pointing `immich_url` at another machine over `http://` — which is what `setup --url` suggests — sends Immich's admin key on every request in clear text across the LAN. The watcher now says so once, and leaves the choice to you.
+
 ## 1.18.0 - 2026-10-28
 
 ### Fixed

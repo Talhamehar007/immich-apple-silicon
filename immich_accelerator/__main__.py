@@ -33,8 +33,10 @@ from pathlib import Path
 from .common import (
     AUTO_REQUEUE_EVERY,
     auto_requeue_enabled,
+    bind_host,
     COMPONENTS,
     DEFAULT_TIMEOUT,
+    insecure_immich_url,
     NOTICE_TEXT,
     component_enabled,
     immich_busy,
@@ -3529,6 +3531,36 @@ def _dashboard_port() -> int:
         return 8420
 
 
+def _dashboard_host(config: dict | None = None) -> str:
+    """Configured dashboard bind address (default 0.0.0.0).
+
+    Validated by common.bind_host: "0.0.0.0" or "127.0.0.1" only, because
+    every liveness check in this file probes loopback.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except (RuntimeError, ValueError, OSError):
+            return bind_host({}, "dashboard_host")
+    return bind_host(config, "dashboard_host")
+
+
+def _ml_host(config: dict | None = None) -> str:
+    """Configured ML bind address (default 0.0.0.0).
+
+    Both engines read ML_HOST: the Python venv's config.py has always taken it,
+    and the native engine reads it too. The default stays "every interface"
+    because Immich in Docker reaches the Mac through host.docker.internal,
+    which is not loopback.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except (RuntimeError, ValueError, OSError):
+            return bind_host({}, "ml_host")
+    return bind_host(config, "ml_host")
+
+
 # The three separable processes. Each can be turned off independently, and each
 # is a real process boundary — which is exactly where this stops. Video,
 # thumbnails and RAW decode all happen inside the single microservices worker,
@@ -3652,6 +3684,7 @@ def start_dashboard() -> bool:
     if read_pid("dashboard"):
         return True  # already tracked + alive (also guards a just-spawned one)
     port = _dashboard_port()
+    host = _dashboard_host()
     # Untracked but already serving (an orphan from a prior run whose pid file
     # was lost) — adopt its pid so a later stop can reach it. Only if it's
     # actually our dashboard, though: never adopt a foreign process that merely
@@ -3682,6 +3715,8 @@ def start_dashboard() -> bool:
                 "dashboard",
                 "--port",
                 str(port),
+                "--host",
+                host,
             ],
             cwd=str(Path(__file__).parent.parent),
             stdout=dash_log,
@@ -3691,7 +3726,11 @@ def start_dashboard() -> bool:
     finally:
         dash_log.close()
     write_pid("dashboard", proc.pid)
-    log.info("Dashboard started: http://localhost:%d", port)
+    log.info(
+        "Dashboard started: http://%s:%d",
+        "localhost" if host == "0.0.0.0" else host,
+        port,
+    )
     return True
 
 
@@ -3932,7 +3971,8 @@ def _validate_connectivity(config: dict) -> bool:
 # Docker-identical output silently went back to VideoToolbox the next time they
 # ran the documented repair step.
 _PRESERVED_CONFIG_KEYS = (
-    "api_key", "ml_url", "dashboard_port", "dashboard", "ml", "env",
+    "api_key", "ml_url", "dashboard_port", "dashboard_host", "ml_host",
+    "dashboard", "ml", "env",
 )
 
 
@@ -5363,6 +5403,7 @@ def _native_ml_spec(config: dict, env: dict):
     env = dict(env)
     env["ML_CLIP_DIR"] = str(clip_dir)
     env["ML_ARCFACE"] = str(arcface)
+    env["ML_HOST"] = _ml_host(config)
     ml_port = int(config.get("ml_port", 3003))
     return [str(bundle / NATIVE_EXE), "serve", str(ml_port)], str(bundle), env
 
@@ -5431,7 +5472,9 @@ def _venv_ml_spec(config: dict, env: dict):
         # chosen for this work precisely because memory is the scarce resource.
         # It also leaves several processes on the port under a master that
         # ml.pid does not name, and nothing here is written to expect that.
-        env = dict(env, PYTHONUNBUFFERED="1", WEB_CONCURRENCY="1")
+        env = dict(
+            env, PYTHONUNBUFFERED="1", WEB_CONCURRENCY="1", ML_HOST=_ml_host(config)
+        )
         return [str(ml_python), "-m", "src.main"], str(ml_dir), env
     return None
 
@@ -7132,6 +7175,12 @@ def _watch_without_worker(config: dict) -> str | None:
         except KeyboardInterrupt:
             log.info("Watch stopped")
             return None
+        except Exception:
+            # Same rule as _watch_worker: one bad cycle is not a reason to stop
+            # supervising, and a restart would only arrive at the same state.
+            log.exception(
+                "Watch cycle failed; services keep running, retrying in 30s."
+            )
 
 
 def cmd_watch(_args):
@@ -7149,7 +7198,20 @@ def cmd_watch(_args):
     _SUPERVISING_ML = True
     _move_onto_launcher()
     while True:
-        config = load_config()
+        try:
+            config = load_config()
+        except (RuntimeError, ValueError, OSError) as e:
+            # Missing (never set up, or half way through a reinstall) and
+            # malformed (hand edited) both land here. Retrying keeps the
+            # process alive for launchd and picks the file up the moment it
+            # exists again, where exiting would crash-loop.
+            log.error("Cannot read %s: %s", CONFIG_FILE, e)
+            log.error(
+                "  Fix the file, or re-run 'immich-accelerator setup'. "
+                "Retrying in 30s."
+            )
+            time.sleep(30)
+            continue
         if _component_enabled("worker", config):
             outcome = _watch_worker(config)
         else:
@@ -7495,11 +7557,27 @@ def _watch_worker(config: dict) -> str | None:
     else:
         reconcile_components(config)
 
-    # Warn if auto-update won't work for remote setups
-    _watch_config = load_config()
+    # Warn if auto-update won't work for remote setups. Re-read here rather
+    # than trusting the copy cmd_watch passed in: setup may have rewritten the
+    # file between the two, and a config that vanished must not stop the
+    # watcher before it has started anything.
+    try:
+        _watch_config = load_config()
+    except (RuntimeError, ValueError, OSError):
+        _watch_config = config
     if _watch_config.get("immich_url") and not _watch_config.get("api_key"):
         log.warning("Auto-update disabled: immich_url is set but api_key is missing.")
         log.warning("  Add api_key to %s to enable version checking.", CONFIG_FILE)
+    insecure_url = insecure_immich_url(_watch_config)
+    if insecure_url:
+        log.warning(
+            "Immich is configured at %s over plain HTTP: every API request "
+            "carries the key in clear text on the network.",
+            insecure_url,
+        )
+        log.warning(
+            "  Use an https:// URL if that network is not one you control."
+        )
 
     check_count = 0
     follow_retry_at = 0.0  # monotonic; after a failed version switch, wait
@@ -7846,6 +7924,15 @@ def _watch_worker(config: dict) -> str | None:
         except KeyboardInterrupt:
             log.info("Watch stopped")
             return
+        except Exception:
+            # A supervisor that dies on one bad cycle stops supervising, and
+            # launchd restarts it into the same bad cycle: a crash loop with
+            # the worker and ML down, from what is usually a bad read (a
+            # hand-edited config.json) rather than anything fatal. The services
+            # it already started keep running, so take the next cycle instead.
+            log.exception(
+                "Watch cycle failed; services keep running, retrying in 30s."
+            )
 
 
 def _watcher_running() -> bool:
@@ -8055,9 +8142,10 @@ def cmd_dashboard(args):
     config = load_config()
     import importlib
 
+    host = getattr(args, "host", None) or _dashboard_host(config)
     dashboard_mod = importlib.import_module(".dashboard", package=__package__)
-    log.info("Starting dashboard on port %d...", args.port)
-    dashboard_mod.run_dashboard(config, port=args.port)
+    log.info("Starting dashboard on port %d (%s)...", args.port, host)
+    dashboard_mod.run_dashboard(config, port=args.port, host=host)
 
 
 # Immich's own transcode settings, so "stock" here means what a Docker Immich
@@ -9101,6 +9189,14 @@ def main():
         help="Enable or disable the dashboard (omit to run it in the foreground)",
     )
     dash_p.add_argument("--port", type=int, default=8420, help="Dashboard port")
+    dash_p.add_argument(
+        "--host",
+        choices=["0.0.0.0", "127.0.0.1"],
+        help=(
+            "Bind address (default: dashboard_host in config.json, else 0.0.0.0). "
+            "Use 127.0.0.1 to keep the dashboard off the network."
+        ),
+    )
     comp_p = sub.add_parser(
         "component", help="Turn worker / ml / dashboard on or off (omit args to list)"
     )
